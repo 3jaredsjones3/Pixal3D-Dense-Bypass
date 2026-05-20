@@ -28,3 +28,4 @@ tmp
 
 experiments/dense_bypass/coords/**/*.npz
 experiments/dense_bypass/coords/**/*.json
+experiments/dense_bypass/profiles/*.json
