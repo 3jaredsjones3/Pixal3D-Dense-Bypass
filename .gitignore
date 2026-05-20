@@ -24,3 +24,7 @@ env/
 Thumbs.db
 
 tmp
+
+
+experiments/dense_bypass/coords/**/*.npz
+experiments/dense_bypass/coords/**/*.json
