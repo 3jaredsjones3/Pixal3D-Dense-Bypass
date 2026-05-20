@@ -254,46 +254,48 @@ class Pixal3DImageTo3DPipeline(Pipeline):
             dict with 'cond' and 'neg_cond', each containing {'global': ..., 'proj': SparseTensor}
         """
         device = self.device
-        if self.low_vram:
-            image_cond_model.to(device)
-
-        orig_grid_res = image_cond_model.grid_resolution
-        orig_proj_grid = image_cond_model.proj_grid
-        grid_overridden = grid_resolution_override is not None and grid_resolution_override != orig_grid_res
-        if grid_overridden:
-            image_cond_model.grid_resolution = grid_resolution_override
-            image_cond_model.proj_grid = image_cond_model.proj_grid.__class__(
-                grid_resolution=grid_resolution_override,
-                image_resolution=image_cond_model.proj_grid.image_resolution,
-            ).to(device)
-
         try:
-            B = 1
-            cam_angle = torch.tensor([camera_angle_x], device=device)
-            dist_tensor = torch.tensor([distance], device=device)
-            scale_tensor = torch.tensor([mesh_scale], device=device)
-            z_global, z_proj = image_cond_model(
-                image, camera_angle_x=cam_angle, distance=dist_tensor, mesh_scale=scale_tensor,
-            )
-            grid_res = image_cond_model.grid_resolution
-            z_proj_grid = z_proj.reshape(B, grid_res, grid_res, grid_res, -1)
-            batch_indices = coords[:, 0].long()
-            x_coords = coords[:, 1].long()
-            y_coords = coords[:, 2].long()
-            z_coords = coords[:, 3].long()
-            z_proj_sparse = z_proj_grid[batch_indices, x_coords, y_coords, z_coords]
-            z_proj_st = SparseTensor(feats=z_proj_sparse, coords=coords)
-        finally:
-            if grid_overridden:
-                image_cond_model.grid_resolution = orig_grid_res
-                image_cond_model.proj_grid = orig_proj_grid
+            if self.low_vram:
+                image_cond_model.to(device)
 
-        if self.low_vram:
-            image_cond_model.cpu()
-        return {
-            'cond': {'global': z_global, 'proj': z_proj_st},
-            'neg_cond': {'global': torch.zeros_like(z_global), 'proj': SparseTensor(feats=torch.zeros_like(z_proj_sparse), coords=coords)},
-        }
+            orig_grid_res = image_cond_model.grid_resolution
+            orig_proj_grid = image_cond_model.proj_grid
+            grid_overridden = grid_resolution_override is not None and grid_resolution_override != orig_grid_res
+            if grid_overridden:
+                image_cond_model.grid_resolution = grid_resolution_override
+                image_cond_model.proj_grid = image_cond_model.proj_grid.__class__(
+                    grid_resolution=grid_resolution_override,
+                    image_resolution=image_cond_model.proj_grid.image_resolution,
+                ).to(device)
+
+            try:
+                B = 1
+                cam_angle = torch.tensor([camera_angle_x], device=device)
+                dist_tensor = torch.tensor([distance], device=device)
+                scale_tensor = torch.tensor([mesh_scale], device=device)
+                z_global, z_proj = image_cond_model(
+                    image, camera_angle_x=cam_angle, distance=dist_tensor, mesh_scale=scale_tensor,
+                )
+                grid_res = image_cond_model.grid_resolution
+                z_proj_grid = z_proj.reshape(B, grid_res, grid_res, grid_res, -1)
+                batch_indices = coords[:, 0].long()
+                x_coords = coords[:, 1].long()
+                y_coords = coords[:, 2].long()
+                z_coords = coords[:, 3].long()
+                z_proj_sparse = z_proj_grid[batch_indices, x_coords, y_coords, z_coords]
+                z_proj_st = SparseTensor(feats=z_proj_sparse, coords=coords)
+            finally:
+                if grid_overridden:
+                    image_cond_model.grid_resolution = orig_grid_res
+                    image_cond_model.proj_grid = orig_proj_grid
+
+            return {
+                'cond': {'global': z_global, 'proj': z_proj_st},
+                'neg_cond': {'global': torch.zeros_like(z_global), 'proj': SparseTensor(feats=torch.zeros_like(z_proj_sparse), coords=coords)},
+            }
+        finally:
+            if self.low_vram:
+                image_cond_model.cpu()
 
     # =========================================================================
     # Sampling methods (consistent with Trellis2)
