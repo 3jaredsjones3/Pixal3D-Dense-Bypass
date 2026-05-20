@@ -2,6 +2,7 @@ from typing import *
 import torch
 import torch.nn as nn
 import numpy as np
+from pathlib import Path
 from PIL import Image
 from .base import Pipeline
 from . import samplers, rembg
@@ -605,6 +606,54 @@ class Pixal3DImageTo3DPipeline(Pipeline):
             )
         return out_mesh
     
+    def _prepare_external_coords(
+        self,
+        coords: Union[torch.Tensor, np.ndarray, str, Path],
+        resolution: int,
+    ) -> torch.Tensor:
+        """
+        Load and validate external sparse coordinates.
+        """
+        if isinstance(coords, (str, Path)):
+            path = Path(coords)
+            if path.suffix != '.npz':
+                raise ValueError(f"External coords path must be an .npz file: {path}")
+            with np.load(path) as data:
+                if 'coords' in data:
+                    coords = data['coords']
+                elif 'q_xyz' in data:
+                    coords = data['q_xyz']
+                else:
+                    raise ValueError("External coords .npz must contain either 'coords' or 'q_xyz'.")
+
+        coords = torch.as_tensor(coords, device=self.device)
+        if coords.ndim != 2:
+            raise ValueError(f"External coords must have rank 2, got shape {tuple(coords.shape)}.")
+        if coords.shape[1] == 3:
+            zeros = torch.zeros((coords.shape[0], 1), device=self.device, dtype=coords.dtype)
+            coords = torch.cat([zeros, coords], dim=1)
+        elif coords.shape[1] != 4:
+            raise ValueError(f"External coords must have shape [N, 4] or [N, 3], got {tuple(coords.shape)}.")
+
+        if torch.is_complex(coords):
+            raise ValueError("External coords must be real-valued.")
+        if not torch.is_floating_point(coords):
+            coords_i32 = coords.to(torch.int32)
+        else:
+            if not torch.isfinite(coords).all():
+                raise ValueError("External coords must be finite.")
+            if not torch.equal(coords, coords.round()):
+                raise ValueError("External coords must contain integer values.")
+            coords_i32 = coords.round().to(torch.int32)
+
+        xyz = coords_i32[:, 1:]
+        if ((xyz < 0) | (xyz >= resolution)).any():
+            raise ValueError(f"External x/y/z coords must be in [0, {resolution}).")
+        if torch.unique(coords_i32, dim=0).shape[0] != coords_i32.shape[0]:
+            raise ValueError("External coords must be unique.")
+
+        return coords_i32
+
     @torch.no_grad()
     def run(
         self,
@@ -619,6 +668,11 @@ class Pixal3DImageTo3DPipeline(Pipeline):
         return_latent: bool = False,
         pipeline_type: Optional[str] = None,
         max_num_tokens: int = 49152,
+        external_coords: Optional[Union[torch.Tensor, np.ndarray, str, Path]] = None,
+        external_hr_coords: Optional[Union[torch.Tensor, np.ndarray, str, Path]] = None,
+        external_coords_resolution: int = 32,
+        external_hr_coords_resolution: int = 64,
+        dense_bypass_debug: bool = False,
     ) -> List[MeshWithVoxel]:
         """
         Run the Pixal3D pipeline (proj mode, cascade).
@@ -638,6 +692,13 @@ class Pixal3DImageTo3DPipeline(Pipeline):
             return_latent (bool): Whether to return the latent codes.
             pipeline_type (str): The type of the pipeline. Options: '1024_cascade', '1536_cascade'.
             max_num_tokens (int): The maximum number of tokens to use.
+            external_coords: Optional LR sparse coords as a tensor, ndarray, or .npz containing
+                'coords' [N, 4] or 'q_xyz' [N, 3]. When provided, sparse structure sampling is skipped.
+            external_hr_coords: Optional HR sparse coords as a tensor, ndarray, or .npz containing
+                'coords' [N, 4] or 'q_xyz' [N, 3]. When provided, LR-to-HR upsampling is skipped.
+            external_coords_resolution (int): Grid resolution used to validate external_coords.
+            external_hr_coords_resolution (int): Grid resolution used to validate external_hr_coords.
+            dense_bypass_debug (bool): Print token count and x/y/z min/max for external coords.
         """
         # Check pipeline type
         pipeline_type = pipeline_type or self.default_pipeline_type
@@ -656,7 +717,8 @@ class Pixal3DImageTo3DPipeline(Pipeline):
                              f"Supported: '1024_cascade', '1536_cascade'.")
 
         # Validate image_cond_models are set
-        assert self.image_cond_model_ss is not None, "image_cond_model_ss not set."
+        if external_coords is None:
+            assert self.image_cond_model_ss is not None, "image_cond_model_ss not set."
         assert self.image_cond_model_shape_512 is not None, "image_cond_model_shape_512 not set."
         assert self.image_cond_model_shape_1024 is not None, "image_cond_model_shape_1024 not set."
         assert self.image_cond_model_tex_1024 is not None, "image_cond_model_tex_1024 not set."
@@ -671,19 +733,31 @@ class Pixal3DImageTo3DPipeline(Pipeline):
         torch.manual_seed(seed)
 
         # ---- Stage 1: Sparse Structure (proj) ----
-        cond_ss = self.get_proj_cond_ss(
-            [image],
-            camera_angle_x=camera_angle_x,
-            distance=distance,
-            mesh_scale=mesh_scale,
-        )
-        ss_res = 32
-        coords = self.sample_sparse_structure(
-            cond_ss, ss_res,
-            num_samples, sparse_structure_sampler_params
-        )
-        del cond_ss
-        torch.cuda.empty_cache()
+        if external_coords is None:
+            cond_ss = self.get_proj_cond_ss(
+                [image],
+                camera_angle_x=camera_angle_x,
+                distance=distance,
+                mesh_scale=mesh_scale,
+            )
+            ss_res = 32
+            coords = self.sample_sparse_structure(
+                cond_ss, ss_res,
+                num_samples, sparse_structure_sampler_params
+            )
+            del cond_ss
+            torch.cuda.empty_cache()
+        else:
+            coords = self._prepare_external_coords(external_coords, external_coords_resolution)
+            if dense_bypass_debug:
+                xyz = coords[:, 1:]
+                if coords.shape[0] > 0:
+                    print(
+                        f"Dense bypass LR coords: tokens={coords.shape[0]}, "
+                        f"min={xyz.min(dim=0).values.tolist()}, max={xyz.max(dim=0).values.tolist()}"
+                    )
+                else:
+                    print("Dense bypass LR coords: tokens=0")
 
         # ---- Stage 2: Shape LR 512 (proj) ----
         cond_shape_lr = self.get_proj_cond_shape(
@@ -691,6 +765,7 @@ class Pixal3DImageTo3DPipeline(Pipeline):
             camera_angle_x=camera_angle_x,
             distance=distance,
             mesh_scale=mesh_scale,
+            grid_resolution_override=external_coords_resolution if external_coords is not None else None,
         )
         lr_slat = self.sample_shape_slat(
             cond_shape_lr, self.models['shape_slat_flow_model_512'],
@@ -700,30 +775,45 @@ class Pixal3DImageTo3DPipeline(Pipeline):
         torch.cuda.empty_cache()
 
         # ---- Stage 3a: Upsample LR → HR ----
-        if self.low_vram:
-            self.models['shape_slat_decoder'].to(self.device)
-            self.models['shape_slat_decoder'].low_vram = True
-        hr_coords = self.models['shape_slat_decoder'].upsample(lr_slat, upsample_times=4)
-        if self.low_vram:
-            self.models['shape_slat_decoder'].cpu()
-            self.models['shape_slat_decoder'].low_vram = False
+        if external_hr_coords is None:
+            if self.low_vram:
+                self.models['shape_slat_decoder'].to(self.device)
+                self.models['shape_slat_decoder'].low_vram = True
+            hr_coords = self.models['shape_slat_decoder'].upsample(lr_slat, upsample_times=4)
+            if self.low_vram:
+                self.models['shape_slat_decoder'].cpu()
+                self.models['shape_slat_decoder'].low_vram = False
 
-        lr_resolution = 512
-        actual_hr_resolution = hr_resolution
-        while True:
-            grid_res = actual_hr_resolution // 16
-            quant_coords = torch.cat([
-                hr_coords[:, :1],
-                ((hr_coords[:, 1:] + 0.5) / lr_resolution * (grid_res - 1)).round().int(),
-            ], dim=1)
-            hr_coords_unique = quant_coords.unique(dim=0)
-            num_tokens = hr_coords_unique.shape[0]
-            if num_tokens < max_num_tokens or actual_hr_resolution == 1024:
-                break
-            actual_hr_resolution -= 128
+            lr_resolution = 512
+            actual_hr_resolution = hr_resolution
+            while True:
+                grid_res = actual_hr_resolution // 16
+                quant_coords = torch.cat([
+                    hr_coords[:, :1],
+                    ((hr_coords[:, 1:] + 0.5) / lr_resolution * (grid_res - 1)).round().int(),
+                ], dim=1)
+                hr_coords_unique = quant_coords.unique(dim=0)
+                num_tokens = hr_coords_unique.shape[0]
+                if num_tokens < max_num_tokens or actual_hr_resolution == 1024:
+                    break
+                actual_hr_resolution -= 128
 
-        actual_grid_res = actual_hr_resolution // 16
-        del lr_slat, hr_coords, quant_coords
+            actual_grid_res = actual_hr_resolution // 16
+            del lr_slat, hr_coords, quant_coords
+        else:
+            hr_coords_unique = self._prepare_external_coords(external_hr_coords, external_hr_coords_resolution)
+            actual_grid_res = external_hr_coords_resolution
+            actual_hr_resolution = external_hr_coords_resolution * 16
+            if dense_bypass_debug:
+                xyz = hr_coords_unique[:, 1:]
+                if hr_coords_unique.shape[0] > 0:
+                    print(
+                        f"Dense bypass HR coords: tokens={hr_coords_unique.shape[0]}, "
+                        f"min={xyz.min(dim=0).values.tolist()}, max={xyz.max(dim=0).values.tolist()}"
+                    )
+                else:
+                    print("Dense bypass HR coords: tokens=0")
+            del lr_slat
         torch.cuda.empty_cache()
 
         # ---- Stage 3b: Shape HR (proj) ----
