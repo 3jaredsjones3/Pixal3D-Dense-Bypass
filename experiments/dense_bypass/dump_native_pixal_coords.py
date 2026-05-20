@@ -23,6 +23,7 @@ representations_stub.MeshWithVoxel = object
 sys.modules.setdefault("pixal3d.representations", representations_stub)
 
 from pixal3d.pipelines import Pixal3DImageTo3DPipeline
+from pixal3d.pipelines import pixal3d_image_to_3d as pixal_pipeline_module
 
 
 IMAGE_COND_CONFIGS = {
@@ -69,9 +70,51 @@ def save_coords(path, coords):
     print(f"Wrote {path}")
 
 
+class DisabledRembg:
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def eval(self):
+        return self
+
+    def to(self, device):
+        return self
+
+    def cpu(self):
+        return self
+
+    def __call__(self, image):
+        raise RuntimeError(
+            "RMBG is disabled for coordinate dumping. Use --load-rembg if preprocessing is needed."
+        )
+
+
 def load_pipeline(args, device):
+    if args.preprocess_image and not args.load_rembg:
+        raise ValueError("--preprocess-image requires --load-rembg because background removal may be needed.")
+
     print(f"Loading Pixal3D pipeline from {args.model_path}...")
-    pipeline = Pixal3DImageTo3DPipeline.from_pretrained(args.model_path)
+    had_model_names_to_load = hasattr(Pixal3DImageTo3DPipeline, "model_names_to_load")
+    original_model_names_to_load = getattr(Pixal3DImageTo3DPipeline, "model_names_to_load", None)
+    original_rembg_birefnet = pixal_pipeline_module.rembg.BiRefNet
+    if args.skip_hr:
+        print("--skip-hr enabled: loading sparse-structure models only.")
+        Pixal3DImageTo3DPipeline.model_names_to_load = {
+            "sparse_structure_flow_model",
+            "sparse_structure_decoder",
+        }
+    if not args.load_rembg:
+        print("--load-rembg not supplied: using disabled RMBG placeholder.")
+        pixal_pipeline_module.rembg.BiRefNet = DisabledRembg
+    try:
+        pipeline = Pixal3DImageTo3DPipeline.from_pretrained(args.model_path)
+    finally:
+        pixal_pipeline_module.rembg.BiRefNet = original_rembg_birefnet
+        if had_model_names_to_load:
+            Pixal3DImageTo3DPipeline.model_names_to_load = original_model_names_to_load
+        else:
+            delattr(Pixal3DImageTo3DPipeline, "model_names_to_load")
+
     pipeline.low_vram = args.low_vram
     pipeline._device = device
 
@@ -178,6 +221,7 @@ def parse_args():
     parser.add_argument("--distance", type=float, default=2.0)
     parser.add_argument("--mesh-scale", type=float, default=1.0)
     parser.add_argument("--preprocess-image", action="store_true")
+    parser.add_argument("--load-rembg", action="store_true", help="Load the RMBG background-removal model.")
     parser.add_argument("--low-vram", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--skip-hr", action="store_true", help="Only dump native sparse structure coords at 32^3.")
     return parser.parse_args()
