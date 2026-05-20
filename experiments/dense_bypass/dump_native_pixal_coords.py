@@ -1,6 +1,7 @@
 import argparse
 import os
 import sys
+import types
 from pathlib import Path
 
 import torch
@@ -14,6 +15,12 @@ os.environ.setdefault(
     "FLEX_GEMM_AUTOTUNE_CACHE_PATH",
     str(REPO_ROOT / "autotune_cache.json"),
 )
+
+# Coord-dump-only script: avoid mesh decode dependencies such as cumesh.
+representations_stub = types.ModuleType("pixal3d.representations")
+representations_stub.Mesh = object
+representations_stub.MeshWithVoxel = object
+sys.modules.setdefault("pixal3d.representations", representations_stub)
 
 from pixal3d.pipelines import Pixal3DImageTo3DPipeline
 
